@@ -327,11 +327,11 @@ impl PostFlopGame {
         }
 
         let num_bytes = if enable_compression { 2 } else { 4 };
-        if num_bytes * self.num_storage > isize::MAX as u64
-            || num_bytes * self.num_storage_chance > isize::MAX as u64
-        {
-            panic!("Memory usage exceeds maximum size");
-        }
+        // if num_bytes * self.num_storage > isize::MAX as u64
+        //     || num_bytes * self.num_storage_chance > isize::MAX as u64
+        // {
+        //     panic!("Memory usage exceeds maximum size");
+        // }
 
         self.state = State::MemoryAllocated;
         self.is_compression_enabled = enable_compression;
