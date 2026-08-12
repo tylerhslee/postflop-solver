@@ -1,7 +1,7 @@
 use postflop_solver::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -324,14 +324,25 @@ fn run_worker() -> ExitCode {
     let mut output = BufWriter::new(stdout.lock());
     let mut solutions = HashMap::<String, StoredSolution>::new();
     let mut cache = HashMap::<String, String>::new();
+    let mut recency = VecDeque::<String>::new();
+    let max_solutions = env::var("POSTFLOP_WORKER_MAX_SOLUTIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32);
     let mut next_solution = 1_u64;
 
     for line in BufReader::new(stdin.lock()).lines() {
         let response = match line {
             Ok(line) => match serde_json::from_str::<Value>(&line) {
-                Ok(envelope) => {
-                    handle_worker_request(envelope, &mut solutions, &mut cache, &mut next_solution)
-                }
+                Ok(envelope) => handle_worker_request(
+                    envelope,
+                    &mut solutions,
+                    &mut cache,
+                    &mut recency,
+                    max_solutions,
+                    &mut next_solution,
+                ),
                 Err(error) => worker_error(None, "worker", json_error(error)),
             },
             Err(error) => worker_error(
@@ -358,6 +369,8 @@ fn handle_worker_request(
     envelope: Value,
     solutions: &mut HashMap<String, StoredSolution>,
     cache: &mut HashMap<String, String>,
+    recency: &mut VecDeque<String>,
+    max_solutions: usize,
     next_solution: &mut u64,
 ) -> Value {
     let id = envelope.get("id").cloned();
@@ -377,13 +390,21 @@ fn handle_worker_request(
             "status": "ready",
             "solution_count": solutions.len(),
         })),
-        "solve" => worker_solve(envelope.get("request"), solutions, cache, next_solution),
-        "query_node" => worker_query_node(&envelope, solutions),
+        "solve" => worker_solve(
+            envelope.get("request"),
+            solutions,
+            cache,
+            recency,
+            max_solutions,
+            next_solution,
+        ),
+        "query_node" => worker_query_node(&envelope, solutions, recency),
         "evict" => (|| {
             let solution_id = required_string(&envelope, "solution_id")?;
             let evicted = solutions.remove(solution_id).is_some();
             if evicted {
                 cache.retain(|_, cached_id| cached_id != solution_id);
+                recency.retain(|cached_id| cached_id != solution_id);
             }
             Ok(json!({
                 "evicted": evicted,
@@ -412,6 +433,8 @@ fn worker_solve(
     request_value: Option<&Value>,
     solutions: &mut HashMap<String, StoredSolution>,
     cache: &mut HashMap<String, String>,
+    recency: &mut VecDeque<String>,
+    max_solutions: usize,
     next_solution: &mut u64,
 ) -> Result<Value, CliError> {
     let request_value = request_value
@@ -428,8 +451,8 @@ fn worker_solve(
         field: None,
     })?;
 
-    if let Some(solution_id) = cache.get(&cache_key) {
-        if let Some(stored) = solutions.get_mut(solution_id) {
+    if let Some(solution_id) = cache.get(&cache_key).cloned() {
+        if let Some(stored) = solutions.get_mut(&solution_id) {
             let mut response = stored.response.clone();
             let inspections = inspect_requested_hands(&mut stored.game, &request.inspect_hands)?;
             response["inspections"] =
@@ -439,7 +462,8 @@ fn worker_solve(
                     field: None,
                 })?;
             response["cache_hit"] = json!(true);
-            response["solution_id"] = json!(solution_id);
+            response["solution_id"] = json!(&solution_id);
+            touch_solution(recency, &solution_id);
             return Ok(response);
         }
     }
@@ -461,13 +485,26 @@ fn worker_solve(
             response: response.clone(),
         },
     );
-    cache.insert(cache_key, solution_id);
+    cache.insert(cache_key, solution_id.clone());
+    touch_solution(recency, &solution_id);
+    while solutions.len() > max_solutions {
+        if let Some(evicted_id) = recency.pop_front() {
+            solutions.remove(&evicted_id);
+            cache.retain(|_, cached_id| cached_id != &evicted_id);
+        }
+    }
     Ok(response)
+}
+
+fn touch_solution(recency: &mut VecDeque<String>, solution_id: &str) {
+    recency.retain(|cached_id| cached_id != solution_id);
+    recency.push_back(solution_id.to_owned());
 }
 
 fn worker_query_node(
     envelope: &Value,
     solutions: &mut HashMap<String, StoredSolution>,
+    recency: &mut VecDeque<String>,
 ) -> Result<Value, CliError> {
     let solution_id = required_string(envelope, "solution_id")?;
     let path: Vec<String> = serde_json::from_value(
@@ -484,21 +521,89 @@ fn worker_query_node(
             "solution_id",
         )
     })?;
+    touch_solution(recency, solution_id);
     stored.game.back_to_root();
     follow_path(&mut stored.game, &path)?;
-    let player = if stored.game.current_player() == 0 {
-        Player::Oop
+    let kind = node_kind(&stored.game);
+    let (actor, actions, hands) = if kind == "decision" {
+        let player = if stored.game.current_player() == 0 {
+            Player::Oop
+        } else {
+            Player::Ip
+        };
+        let (actions, hands) = inspect_current_node(&mut stored.game, player)?;
+        (json!(player), actions, json!(hands))
     } else {
-        Player::Ip
+        (Value::Null, Vec::new(), Value::Null)
     };
-    let (actions, hands) = inspect_current_node(&mut stored.game, player)?;
+    let children = node_children(&mut stored.game, &path)?;
+    let terminal = if kind == "terminal" {
+        json!({"reason": "hand_complete"})
+    } else {
+        Value::Null
+    };
     Ok(json!({
         "solution_id": solution_id,
         "path": path,
-        "actor": player,
+        "node_kind": kind,
+        "actor": actor,
         "actions": actions,
         "hands": hands,
+        "children": children,
+        "terminal": terminal,
     }))
+}
+
+fn node_kind(game: &PostFlopGame) -> &'static str {
+    if game.is_terminal_node() {
+        "terminal"
+    } else if game.is_chance_node() {
+        "chance"
+    } else {
+        "decision"
+    }
+}
+
+fn node_children(game: &mut PostFlopGame, path: &[String]) -> Result<Vec<Value>, CliError> {
+    if game.is_terminal_node() {
+        return Ok(Vec::new());
+    }
+    let history = game.history().to_vec();
+    let mut children = Vec::new();
+    if game.is_chance_node() {
+        let cards = game.possible_cards();
+        let count = cards.count_ones() as f64;
+        for card in 0_u8..52 {
+            if cards & (1_u64 << card) == 0 {
+                continue;
+            }
+            let label = format!(
+                "chance:{}",
+                card_to_string(card).map_err(|message| CliError {
+                    code: "internal_error".into(),
+                    message,
+                    field: None,
+                })?
+            );
+            game.play(card as usize);
+            let mut child_path = path.to_vec();
+            child_path.push(label.clone());
+            children.push(json!({"action": label, "path": child_path, "node_kind": node_kind(game), "probability": 1.0 / count}));
+            game.apply_history(&history);
+        }
+    } else {
+        let actions = game.available_actions();
+        for (index, action) in actions.iter().enumerate() {
+            let label = action_label(action);
+            game.play(index);
+            let mut child_path = path.to_vec();
+            child_path.push(label.clone());
+            children
+                .push(json!({"action": label, "path": child_path, "node_kind": node_kind(game)}));
+            game.apply_history(&history);
+        }
+    }
+    Ok(children)
 }
 
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, CliError> {
@@ -975,13 +1080,6 @@ fn follow_path(game: &mut PostFlopGame, path: &[String]) -> Result<(), CliError>
                 })?;
             game.play(index);
         }
-    }
-    if game.is_terminal_node() || game.is_chance_node() {
-        return Err(field_error(
-            "invalid_path",
-            "path must identify a player decision node",
-            "path",
-        ));
     }
     Ok(())
 }
