@@ -1,10 +1,10 @@
 use postflop_solver::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -159,6 +159,11 @@ struct SolveResponse<'a> {
     inspections: Vec<InspectionResult<'a>>,
 }
 
+struct StoredSolution {
+    game: PostFlopGame,
+    response: Value,
+}
+
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
     let Some(command) = args.next() else {
@@ -184,6 +189,17 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "solve" => run_solve(args.collect()),
+        "worker" => {
+            if args.next().is_some() {
+                return fail(
+                    "worker",
+                    "invalid_arguments",
+                    "worker takes no arguments",
+                    None,
+                );
+            }
+            run_worker()
+        }
         _ => fail(
             "cli",
             "unknown_command",
@@ -302,7 +318,320 @@ fn json_error(error: serde_json::Error) -> CliError {
     }
 }
 
+fn run_worker() -> ExitCode {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    let mut solutions = HashMap::<String, StoredSolution>::new();
+    let mut cache = HashMap::<String, String>::new();
+    let mut recency = VecDeque::<String>::new();
+    let max_solutions = env::var("POSTFLOP_WORKER_MAX_SOLUTIONS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32);
+    let mut next_solution = 1_u64;
+
+    for line in BufReader::new(stdin.lock()).lines() {
+        let response = match line {
+            Ok(line) => match serde_json::from_str::<Value>(&line) {
+                Ok(envelope) => handle_worker_request(
+                    envelope,
+                    &mut solutions,
+                    &mut cache,
+                    &mut recency,
+                    max_solutions,
+                    &mut next_solution,
+                ),
+                Err(error) => worker_error(None, "worker", json_error(error)),
+            },
+            Err(error) => worker_error(
+                None,
+                "worker",
+                CliError {
+                    code: "input_io".into(),
+                    message: error.to_string(),
+                    field: None,
+                },
+            ),
+        };
+        if serde_json::to_writer(&mut output, &response).is_err()
+            || output.write_all(b"\n").is_err()
+            || output.flush().is_err()
+        {
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn handle_worker_request(
+    envelope: Value,
+    solutions: &mut HashMap<String, StoredSolution>,
+    cache: &mut HashMap<String, String>,
+    recency: &mut VecDeque<String>,
+    max_solutions: usize,
+    next_solution: &mut u64,
+) -> Value {
+    let id = envelope.get("id").cloned();
+    let command = match envelope.get("command").and_then(Value::as_str) {
+        Some(command) => command.to_owned(),
+        None => {
+            return worker_error(
+                id,
+                "worker",
+                field_error("invalid_request", "command must be a string", "command"),
+            );
+        }
+    };
+
+    let result: Result<Value, CliError> = match command.as_str() {
+        "health" => Ok(json!({
+            "status": "ready",
+            "solution_count": solutions.len(),
+        })),
+        "solve" => worker_solve(
+            envelope.get("request"),
+            solutions,
+            cache,
+            recency,
+            max_solutions,
+            next_solution,
+        ),
+        "query_node" => worker_query_node(&envelope, solutions, recency),
+        "evict" => (|| {
+            let solution_id = required_string(&envelope, "solution_id")?;
+            let evicted = solutions.remove(solution_id).is_some();
+            if evicted {
+                cache.retain(|_, cached_id| cached_id != solution_id);
+                recency.retain(|cached_id| cached_id != solution_id);
+            }
+            Ok(json!({
+                "evicted": evicted,
+                "solution_count": solutions.len(),
+            }))
+        })(),
+        _ => Err(field_error(
+            "unknown_command",
+            &format!("unknown worker command `{command}`"),
+            "command",
+        )),
+    };
+
+    match result {
+        Ok(mut body) => {
+            body["id"] = id.unwrap_or(Value::Null);
+            body["ok"] = json!(true);
+            body["command"] = json!(command);
+            body
+        }
+        Err(error) => worker_error(id, &command, error),
+    }
+}
+
+fn worker_solve(
+    request_value: Option<&Value>,
+    solutions: &mut HashMap<String, StoredSolution>,
+    cache: &mut HashMap<String, String>,
+    recency: &mut VecDeque<String>,
+    max_solutions: usize,
+    next_solution: &mut u64,
+) -> Result<Value, CliError> {
+    let request_value = request_value
+        .ok_or_else(|| field_error("invalid_request", "solve requires a request", "request"))?;
+    let request: SolveRequest =
+        serde_json::from_value(request_value.clone()).map_err(json_error)?;
+    let mut key_value = request_value.clone();
+    if let Some(object) = key_value.as_object_mut() {
+        object.remove("inspect_hands");
+    }
+    let cache_key = serde_json::to_string(&key_value).map_err(|error| CliError {
+        code: "internal_error".into(),
+        message: error.to_string(),
+        field: None,
+    })?;
+
+    if let Some(solution_id) = cache.get(&cache_key).cloned() {
+        if let Some(stored) = solutions.get_mut(&solution_id) {
+            let mut response = stored.response.clone();
+            let inspections = inspect_requested_hands(&mut stored.game, &request.inspect_hands)?;
+            response["inspections"] =
+                serde_json::to_value(inspections).map_err(|error| CliError {
+                    code: "internal_error".into(),
+                    message: error.to_string(),
+                    field: None,
+                })?;
+            response["cache_hit"] = json!(true);
+            response["solution_id"] = json!(&solution_id);
+            touch_solution(recency, &solution_id);
+            return Ok(response);
+        }
+    }
+
+    let (response, game) = solve_request_with_game(&request)?;
+    let mut response = serde_json::to_value(response).map_err(|error| CliError {
+        code: "internal_error".into(),
+        message: error.to_string(),
+        field: None,
+    })?;
+    let solution_id = format!("solution-{next_solution}");
+    *next_solution += 1;
+    response["cache_hit"] = json!(false);
+    response["solution_id"] = json!(solution_id);
+    solutions.insert(
+        solution_id.clone(),
+        StoredSolution {
+            game,
+            response: response.clone(),
+        },
+    );
+    cache.insert(cache_key, solution_id.clone());
+    touch_solution(recency, &solution_id);
+    while solutions.len() > max_solutions {
+        if let Some(evicted_id) = recency.pop_front() {
+            solutions.remove(&evicted_id);
+            cache.retain(|_, cached_id| cached_id != &evicted_id);
+        }
+    }
+    Ok(response)
+}
+
+fn touch_solution(recency: &mut VecDeque<String>, solution_id: &str) {
+    recency.retain(|cached_id| cached_id != solution_id);
+    recency.push_back(solution_id.to_owned());
+}
+
+fn worker_query_node(
+    envelope: &Value,
+    solutions: &mut HashMap<String, StoredSolution>,
+    recency: &mut VecDeque<String>,
+) -> Result<Value, CliError> {
+    let solution_id = required_string(envelope, "solution_id")?;
+    let path: Vec<String> = serde_json::from_value(
+        envelope
+            .get("path")
+            .cloned()
+            .ok_or_else(|| field_error("invalid_request", "path is required", "path"))?,
+    )
+    .map_err(json_error)?;
+    let stored = solutions.get_mut(solution_id).ok_or_else(|| {
+        field_error(
+            "unknown_solution",
+            &format!("solution `{solution_id}` is not available"),
+            "solution_id",
+        )
+    })?;
+    touch_solution(recency, solution_id);
+    stored.game.back_to_root();
+    follow_path(&mut stored.game, &path)?;
+    let kind = node_kind(&stored.game);
+    let (actor, actions, hands) = if kind == "decision" {
+        let player = if stored.game.current_player() == 0 {
+            Player::Oop
+        } else {
+            Player::Ip
+        };
+        let (actions, hands) = inspect_current_node(&mut stored.game, player)?;
+        (json!(player), actions, json!(hands))
+    } else {
+        (Value::Null, Vec::new(), Value::Null)
+    };
+    let children = node_children(&mut stored.game, &path)?;
+    let terminal = if kind == "terminal" {
+        json!({"reason": "hand_complete"})
+    } else {
+        Value::Null
+    };
+    Ok(json!({
+        "solution_id": solution_id,
+        "path": path,
+        "node_kind": kind,
+        "actor": actor,
+        "actions": actions,
+        "hands": hands,
+        "children": children,
+        "terminal": terminal,
+    }))
+}
+
+fn node_kind(game: &PostFlopGame) -> &'static str {
+    if game.is_terminal_node() {
+        "terminal"
+    } else if game.is_chance_node() {
+        "chance"
+    } else {
+        "decision"
+    }
+}
+
+fn node_children(game: &mut PostFlopGame, path: &[String]) -> Result<Vec<Value>, CliError> {
+    if game.is_terminal_node() {
+        return Ok(Vec::new());
+    }
+    let history = game.history().to_vec();
+    let mut children = Vec::new();
+    if game.is_chance_node() {
+        let cards = game.possible_cards();
+        let count = cards.count_ones() as f64;
+        for card in 0_u8..52 {
+            if cards & (1_u64 << card) == 0 {
+                continue;
+            }
+            let label = format!(
+                "chance:{}",
+                card_to_string(card).map_err(|message| CliError {
+                    code: "internal_error".into(),
+                    message,
+                    field: None,
+                })?
+            );
+            game.play(card as usize);
+            let mut child_path = path.to_vec();
+            child_path.push(label.clone());
+            children.push(json!({"action": label, "path": child_path, "node_kind": node_kind(game), "probability": 1.0 / count}));
+            game.apply_history(&history);
+        }
+    } else {
+        let actions = game.available_actions();
+        for (index, action) in actions.iter().enumerate() {
+            let label = action_label(action);
+            game.play(index);
+            let mut child_path = path.to_vec();
+            child_path.push(label.clone());
+            children
+                .push(json!({"action": label, "path": child_path, "node_kind": node_kind(game)}));
+            game.apply_history(&history);
+        }
+    }
+    Ok(children)
+}
+
+fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, CliError> {
+    value.get(field).and_then(Value::as_str).ok_or_else(|| {
+        field_error(
+            "invalid_request",
+            &format!("{field} must be a string"),
+            field,
+        )
+    })
+}
+
+fn worker_error(id: Option<Value>, command: &str, error: CliError) -> Value {
+    json!({
+        "id": id.unwrap_or(Value::Null),
+        "ok": false,
+        "command": command,
+        "error": error,
+    })
+}
+
 fn solve_request(request: &SolveRequest) -> Result<SolveResponse<'_>, CliError> {
+    solve_request_with_game(request).map(|(response, _)| response)
+}
+
+fn solve_request_with_game(
+    request: &SolveRequest,
+) -> Result<(SolveResponse<'_>, PostFlopGame), CliError> {
     validate_numbers(request)?;
     let (card_config, initial_state) = card_config(request)?;
     let tree_config = TreeConfig {
@@ -384,7 +713,7 @@ fn solve_request(request: &SolveRequest) -> Result<SolveResponse<'_>, CliError> 
         "max_iterations"
     };
 
-    Ok(SolveResponse {
+    let response = SolveResponse {
         ok: true,
         command: "solve",
         schema_version: SCHEMA_VERSION,
@@ -404,7 +733,8 @@ fn solve_request(request: &SolveRequest) -> Result<SolveResponse<'_>, CliError> 
         root_actions,
         nodelocks: lock_results,
         inspections,
-    })
+    };
+    Ok((response, game))
 }
 
 fn validate_numbers(request: &SolveRequest) -> Result<(), CliError> {
@@ -611,20 +941,39 @@ fn inspect_requested_hands<'a>(
         let num_hands = hand_names.len();
         let strategy = game.strategy();
         let evs = game.expected_values(inspection.player.index());
+        let normalized_weights = game.normalized_weights(inspection.player.index());
         let mut hands = Map::new();
 
-        for requested in &inspection.hands {
-            let canonical_hand = canonical_hole(requested, "inspect_hands.hands")?;
-            let hand_index = hand_names
-                .iter()
-                .position(|name| name == &canonical_hand)
-                .ok_or_else(|| {
-                    field_error(
-                        "unknown_hand",
-                        &format!("hand `{requested}` is not in the player's range at this path"),
-                        "inspect_hands.hands",
-                    )
-                })?;
+        let wildcard = inspection.hands.iter().any(|hand| hand == "*");
+        let mut requested_hands = Vec::new();
+        if wildcard {
+            requested_hands.extend(
+                hand_names
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| normalized_weights[*index] > 0.0)
+                    .map(|(index, hand)| (index, hand.clone())),
+            );
+        } else {
+            for requested in &inspection.hands {
+                let canonical_hand = canonical_hole(requested, "inspect_hands.hands")?;
+                let hand_index = hand_names
+                    .iter()
+                    .position(|name| name == &canonical_hand)
+                    .ok_or_else(|| {
+                        field_error(
+                            "unknown_hand",
+                            &format!(
+                                "hand `{requested}` is not in the player's range at this path"
+                            ),
+                            "inspect_hands.hands",
+                        )
+                    })?;
+                requested_hands.push((hand_index, canonical_hand));
+            }
+        }
+
+        for (hand_index, canonical_hand) in requested_hands {
             let mut action_values = Map::new();
             for (action_index, label) in actions.iter().enumerate() {
                 action_values.insert(
@@ -632,13 +981,14 @@ fn inspect_requested_hands<'a>(
                     json!(strategy[action_index * num_hands + hand_index]),
                 );
             }
-            hands.insert(
-                canonical_hand,
-                json!({
-                    "actions": action_values,
-                    "ev": evs[hand_index]
-                }),
-            );
+            let mut hand_value = json!({
+                "actions": action_values,
+                "ev": evs[hand_index]
+            });
+            if wildcard {
+                hand_value["normalized_weight"] = json!(normalized_weights[hand_index]);
+            }
+            hands.insert(canonical_hand, hand_value);
         }
         output.push(InspectionResult {
             path: &inspection.path,
@@ -647,6 +997,46 @@ fn inspect_requested_hands<'a>(
         });
     }
     Ok(output)
+}
+
+fn inspect_current_node(
+    game: &mut PostFlopGame,
+    player: Player,
+) -> Result<(Vec<String>, Map<String, Value>), CliError> {
+    game.cache_normalized_weights();
+    let actions = action_labels(&game.available_actions());
+    let hand_names =
+        holes_to_strings(game.private_cards(player.index())).map_err(|message| CliError {
+            code: "internal_error".into(),
+            message,
+            field: None,
+        })?;
+    let num_hands = hand_names.len();
+    let strategy = game.strategy();
+    let evs = game.expected_values(player.index());
+    let normalized_weights = game.normalized_weights(player.index());
+    let mut hands = Map::new();
+    for (hand_index, hand) in hand_names.into_iter().enumerate() {
+        if normalized_weights[hand_index] <= 0.0 {
+            continue;
+        }
+        let mut action_values = Map::new();
+        for (action_index, label) in actions.iter().enumerate() {
+            action_values.insert(
+                label.clone(),
+                json!(strategy[action_index * num_hands + hand_index]),
+            );
+        }
+        hands.insert(
+            hand,
+            json!({
+                "actions": action_values,
+                "ev": evs[hand_index],
+                "normalized_weight": normalized_weights[hand_index],
+            }),
+        );
+    }
+    Ok((actions, hands))
 }
 
 fn follow_path(game: &mut PostFlopGame, path: &[String]) -> Result<(), CliError> {
@@ -690,13 +1080,6 @@ fn follow_path(game: &mut PostFlopGame, path: &[String]) -> Result<(), CliError>
                 })?;
             game.play(index);
         }
-    }
-    if game.is_terminal_node() || game.is_chance_node() {
-        return Err(field_error(
-            "invalid_path",
-            "path must identify a player decision node",
-            "path",
-        ));
     }
     Ok(())
 }
