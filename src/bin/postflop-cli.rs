@@ -611,20 +611,39 @@ fn inspect_requested_hands<'a>(
         let num_hands = hand_names.len();
         let strategy = game.strategy();
         let evs = game.expected_values(inspection.player.index());
+        let normalized_weights = game.normalized_weights(inspection.player.index());
         let mut hands = Map::new();
 
-        for requested in &inspection.hands {
-            let canonical_hand = canonical_hole(requested, "inspect_hands.hands")?;
-            let hand_index = hand_names
-                .iter()
-                .position(|name| name == &canonical_hand)
-                .ok_or_else(|| {
-                    field_error(
-                        "unknown_hand",
-                        &format!("hand `{requested}` is not in the player's range at this path"),
-                        "inspect_hands.hands",
-                    )
-                })?;
+        let wildcard = inspection.hands.iter().any(|hand| hand == "*");
+        let mut requested_hands = Vec::new();
+        if wildcard {
+            requested_hands.extend(
+                hand_names
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| normalized_weights[*index] > 0.0)
+                    .map(|(index, hand)| (index, hand.clone())),
+            );
+        } else {
+            for requested in &inspection.hands {
+                let canonical_hand = canonical_hole(requested, "inspect_hands.hands")?;
+                let hand_index = hand_names
+                    .iter()
+                    .position(|name| name == &canonical_hand)
+                    .ok_or_else(|| {
+                        field_error(
+                            "unknown_hand",
+                            &format!(
+                                "hand `{requested}` is not in the player's range at this path"
+                            ),
+                            "inspect_hands.hands",
+                        )
+                    })?;
+                requested_hands.push((hand_index, canonical_hand));
+            }
+        }
+
+        for (hand_index, canonical_hand) in requested_hands {
             let mut action_values = Map::new();
             for (action_index, label) in actions.iter().enumerate() {
                 action_values.insert(
@@ -632,13 +651,14 @@ fn inspect_requested_hands<'a>(
                     json!(strategy[action_index * num_hands + hand_index]),
                 );
             }
-            hands.insert(
-                canonical_hand,
-                json!({
-                    "actions": action_values,
-                    "ev": evs[hand_index]
-                }),
-            );
+            let mut hand_value = json!({
+                "actions": action_values,
+                "ev": evs[hand_index]
+            });
+            if wildcard {
+                hand_value["normalized_weight"] = json!(normalized_weights[hand_index]);
+            }
+            hands.insert(canonical_hand, hand_value);
         }
         output.push(InspectionResult {
             path: &inspection.path,
