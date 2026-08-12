@@ -1,10 +1,10 @@
 use postflop_solver::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -159,6 +159,11 @@ struct SolveResponse<'a> {
     inspections: Vec<InspectionResult<'a>>,
 }
 
+struct StoredSolution {
+    game: PostFlopGame,
+    response: Value,
+}
+
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
     let Some(command) = args.next() else {
@@ -184,6 +189,17 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "solve" => run_solve(args.collect()),
+        "worker" => {
+            if args.next().is_some() {
+                return fail(
+                    "worker",
+                    "invalid_arguments",
+                    "worker takes no arguments",
+                    None,
+                );
+            }
+            run_worker()
+        }
         _ => fail(
             "cli",
             "unknown_command",
@@ -302,7 +318,215 @@ fn json_error(error: serde_json::Error) -> CliError {
     }
 }
 
+fn run_worker() -> ExitCode {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut output = BufWriter::new(stdout.lock());
+    let mut solutions = HashMap::<String, StoredSolution>::new();
+    let mut cache = HashMap::<String, String>::new();
+    let mut next_solution = 1_u64;
+
+    for line in BufReader::new(stdin.lock()).lines() {
+        let response = match line {
+            Ok(line) => match serde_json::from_str::<Value>(&line) {
+                Ok(envelope) => {
+                    handle_worker_request(envelope, &mut solutions, &mut cache, &mut next_solution)
+                }
+                Err(error) => worker_error(None, "worker", json_error(error)),
+            },
+            Err(error) => worker_error(
+                None,
+                "worker",
+                CliError {
+                    code: "input_io".into(),
+                    message: error.to_string(),
+                    field: None,
+                },
+            ),
+        };
+        if serde_json::to_writer(&mut output, &response).is_err()
+            || output.write_all(b"\n").is_err()
+            || output.flush().is_err()
+        {
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn handle_worker_request(
+    envelope: Value,
+    solutions: &mut HashMap<String, StoredSolution>,
+    cache: &mut HashMap<String, String>,
+    next_solution: &mut u64,
+) -> Value {
+    let id = envelope.get("id").cloned();
+    let command = match envelope.get("command").and_then(Value::as_str) {
+        Some(command) => command.to_owned(),
+        None => {
+            return worker_error(
+                id,
+                "worker",
+                field_error("invalid_request", "command must be a string", "command"),
+            );
+        }
+    };
+
+    let result: Result<Value, CliError> = match command.as_str() {
+        "health" => Ok(json!({
+            "status": "ready",
+            "solution_count": solutions.len(),
+        })),
+        "solve" => worker_solve(envelope.get("request"), solutions, cache, next_solution),
+        "query_node" => worker_query_node(&envelope, solutions),
+        "evict" => (|| {
+            let solution_id = required_string(&envelope, "solution_id")?;
+            let evicted = solutions.remove(solution_id).is_some();
+            if evicted {
+                cache.retain(|_, cached_id| cached_id != solution_id);
+            }
+            Ok(json!({
+                "evicted": evicted,
+                "solution_count": solutions.len(),
+            }))
+        })(),
+        _ => Err(field_error(
+            "unknown_command",
+            &format!("unknown worker command `{command}`"),
+            "command",
+        )),
+    };
+
+    match result {
+        Ok(mut body) => {
+            body["id"] = id.unwrap_or(Value::Null);
+            body["ok"] = json!(true);
+            body["command"] = json!(command);
+            body
+        }
+        Err(error) => worker_error(id, &command, error),
+    }
+}
+
+fn worker_solve(
+    request_value: Option<&Value>,
+    solutions: &mut HashMap<String, StoredSolution>,
+    cache: &mut HashMap<String, String>,
+    next_solution: &mut u64,
+) -> Result<Value, CliError> {
+    let request_value = request_value
+        .ok_or_else(|| field_error("invalid_request", "solve requires a request", "request"))?;
+    let request: SolveRequest =
+        serde_json::from_value(request_value.clone()).map_err(json_error)?;
+    let mut key_value = request_value.clone();
+    if let Some(object) = key_value.as_object_mut() {
+        object.remove("inspect_hands");
+    }
+    let cache_key = serde_json::to_string(&key_value).map_err(|error| CliError {
+        code: "internal_error".into(),
+        message: error.to_string(),
+        field: None,
+    })?;
+
+    if let Some(solution_id) = cache.get(&cache_key) {
+        if let Some(stored) = solutions.get_mut(solution_id) {
+            let mut response = stored.response.clone();
+            let inspections = inspect_requested_hands(&mut stored.game, &request.inspect_hands)?;
+            response["inspections"] =
+                serde_json::to_value(inspections).map_err(|error| CliError {
+                    code: "internal_error".into(),
+                    message: error.to_string(),
+                    field: None,
+                })?;
+            response["cache_hit"] = json!(true);
+            response["solution_id"] = json!(solution_id);
+            return Ok(response);
+        }
+    }
+
+    let (response, game) = solve_request_with_game(&request)?;
+    let mut response = serde_json::to_value(response).map_err(|error| CliError {
+        code: "internal_error".into(),
+        message: error.to_string(),
+        field: None,
+    })?;
+    let solution_id = format!("solution-{next_solution}");
+    *next_solution += 1;
+    response["cache_hit"] = json!(false);
+    response["solution_id"] = json!(solution_id);
+    solutions.insert(
+        solution_id.clone(),
+        StoredSolution {
+            game,
+            response: response.clone(),
+        },
+    );
+    cache.insert(cache_key, solution_id);
+    Ok(response)
+}
+
+fn worker_query_node(
+    envelope: &Value,
+    solutions: &mut HashMap<String, StoredSolution>,
+) -> Result<Value, CliError> {
+    let solution_id = required_string(envelope, "solution_id")?;
+    let path: Vec<String> = serde_json::from_value(
+        envelope
+            .get("path")
+            .cloned()
+            .ok_or_else(|| field_error("invalid_request", "path is required", "path"))?,
+    )
+    .map_err(json_error)?;
+    let stored = solutions.get_mut(solution_id).ok_or_else(|| {
+        field_error(
+            "unknown_solution",
+            &format!("solution `{solution_id}` is not available"),
+            "solution_id",
+        )
+    })?;
+    stored.game.back_to_root();
+    follow_path(&mut stored.game, &path)?;
+    let player = if stored.game.current_player() == 0 {
+        Player::Oop
+    } else {
+        Player::Ip
+    };
+    let (actions, hands) = inspect_current_node(&mut stored.game, player)?;
+    Ok(json!({
+        "solution_id": solution_id,
+        "path": path,
+        "actor": player,
+        "actions": actions,
+        "hands": hands,
+    }))
+}
+
+fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, CliError> {
+    value.get(field).and_then(Value::as_str).ok_or_else(|| {
+        field_error(
+            "invalid_request",
+            &format!("{field} must be a string"),
+            field,
+        )
+    })
+}
+
+fn worker_error(id: Option<Value>, command: &str, error: CliError) -> Value {
+    json!({
+        "id": id.unwrap_or(Value::Null),
+        "ok": false,
+        "command": command,
+        "error": error,
+    })
+}
+
 fn solve_request(request: &SolveRequest) -> Result<SolveResponse<'_>, CliError> {
+    solve_request_with_game(request).map(|(response, _)| response)
+}
+
+fn solve_request_with_game(
+    request: &SolveRequest,
+) -> Result<(SolveResponse<'_>, PostFlopGame), CliError> {
     validate_numbers(request)?;
     let (card_config, initial_state) = card_config(request)?;
     let tree_config = TreeConfig {
@@ -384,7 +608,7 @@ fn solve_request(request: &SolveRequest) -> Result<SolveResponse<'_>, CliError> 
         "max_iterations"
     };
 
-    Ok(SolveResponse {
+    let response = SolveResponse {
         ok: true,
         command: "solve",
         schema_version: SCHEMA_VERSION,
@@ -404,7 +628,8 @@ fn solve_request(request: &SolveRequest) -> Result<SolveResponse<'_>, CliError> 
         root_actions,
         nodelocks: lock_results,
         inspections,
-    })
+    };
+    Ok((response, game))
 }
 
 fn validate_numbers(request: &SolveRequest) -> Result<(), CliError> {
@@ -667,6 +892,46 @@ fn inspect_requested_hands<'a>(
         });
     }
     Ok(output)
+}
+
+fn inspect_current_node(
+    game: &mut PostFlopGame,
+    player: Player,
+) -> Result<(Vec<String>, Map<String, Value>), CliError> {
+    game.cache_normalized_weights();
+    let actions = action_labels(&game.available_actions());
+    let hand_names =
+        holes_to_strings(game.private_cards(player.index())).map_err(|message| CliError {
+            code: "internal_error".into(),
+            message,
+            field: None,
+        })?;
+    let num_hands = hand_names.len();
+    let strategy = game.strategy();
+    let evs = game.expected_values(player.index());
+    let normalized_weights = game.normalized_weights(player.index());
+    let mut hands = Map::new();
+    for (hand_index, hand) in hand_names.into_iter().enumerate() {
+        if normalized_weights[hand_index] <= 0.0 {
+            continue;
+        }
+        let mut action_values = Map::new();
+        for (action_index, label) in actions.iter().enumerate() {
+            action_values.insert(
+                label.clone(),
+                json!(strategy[action_index * num_hands + hand_index]),
+            );
+        }
+        hands.insert(
+            hand,
+            json!({
+                "actions": action_values,
+                "ev": evs[hand_index],
+                "normalized_weight": normalized_weights[hand_index],
+            }),
+        );
+    }
+    Ok((actions, hands))
 }
 
 fn follow_path(game: &mut PostFlopGame, path: &[String]) -> Result<(), CliError> {
