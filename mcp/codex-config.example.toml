@@ -1,0 +1,22 @@
+# Copy this table into %USERPROFILE%\.codex\config.toml.
+# Adjust the WSL distribution and project path for your machine.
+
+[mcp_servers.postflopSolver]
+command = "wsl.exe"
+args = [
+  "-d",
+  "Ubuntu-24.04",
+  "--",
+  "bash",
+  "-lc",
+  "cd /home/tylerhyun/_projects/PokerCoach/Apps/postflop-solver && exec mcp/run_server.sh",
+]
+startup_timeout_sec = 10
+tool_timeout_sec = 310
+
+[mcp_servers.postflopSolver.env]
+POSTFLOP_SOLVER_CLI = "/home/tylerhyun/_projects/PokerCoach/Apps/postflop-solver/target/release/postflop-cli"
+POSTFLOP_SOLVER_TIMEOUT_MS = "300000"
+POSTFLOP_MCP_MAX_REQUEST_BYTES = "4194304"
+POSTFLOP_SOLVER_MAX_STDOUT_BYTES = "16777216"
+POSTFLOP_SOLVER_MAX_STDERR_BYTES = "1048576"
