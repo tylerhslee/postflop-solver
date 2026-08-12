@@ -69,7 +69,10 @@ impl Worker {
             .output
             .read_line(&mut line)
             .expect("worker response should be readable");
-        assert!(bytes > 0, "worker exited before returning an NDJSON response");
+        assert!(
+            bytes > 0,
+            "worker exited before returning an NDJSON response"
+        );
         assert!(
             line.ends_with('\n'),
             "each worker response must be newline-delimited: {line:?}"
@@ -115,7 +118,10 @@ fn assert_complete_combo_strategy(node: &Value, expected_hands: &[&str]) {
     let actions = node["actions"]
         .as_array()
         .expect("node actions should be an array");
-    assert!(!actions.is_empty(), "decision node should expose its actions");
+    assert!(
+        !actions.is_empty(),
+        "decision node should expose its actions"
+    );
     let action_names = actions
         .iter()
         .map(|action| action.as_str().expect("action labels should be strings"))
@@ -124,7 +130,10 @@ fn assert_complete_combo_strategy(node: &Value, expected_hands: &[&str]) {
     let hands = &node["hands"];
     assert_eq!(keys(hands), expected_hands.iter().copied().collect());
     for (combo, hand) in hands.as_object().expect("hands should be an object") {
-        assert!(hand["ev"].is_number(), "{combo} should include a numeric EV");
+        assert!(
+            hand["ev"].is_number(),
+            "{combo} should include a numeric EV"
+        );
         assert_eq!(
             keys(&hand["actions"]),
             action_names,
