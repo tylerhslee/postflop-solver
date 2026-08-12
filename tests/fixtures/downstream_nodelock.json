@@ -1,0 +1,43 @@
+{
+  "board": "2s3h4d6c7c",
+  "oop_range": "AsAh,QsQh,JsJh",
+  "ip_range": "KsKh",
+  "pot": 10,
+  "effective_stack": 10,
+  "bet_sizes": {
+    "flop": {
+      "oop": { "bet": "", "raise": "" },
+      "ip": { "bet": "", "raise": "" }
+    },
+    "turn": {
+      "oop": { "bet": "", "raise": "" },
+      "ip": { "bet": "", "raise": "" }
+    },
+    "river": {
+      "oop": { "bet": "a", "raise": "" },
+      "ip": { "bet": "a", "raise": "" }
+    }
+  },
+  "thresholds": {
+    "add_allin": 1.5,
+    "force_allin": 0.15,
+    "merge": 0.1
+  },
+  "solve": {
+    "max_iterations": 1000,
+    "target_exploitability": 0.001,
+    "compressed": false
+  },
+  "nodelocks": [
+    {
+      "path": ["check", "all-in"],
+      "player": "oop",
+      "strategy": {
+        "QsQh": { "fold": 0.25, "call": 0.75 }
+      }
+    }
+  ],
+  "inspect_hands": [
+    { "path": ["check", "all-in"], "player": "oop", "hands": ["QsQh"] }
+  ]
+}
